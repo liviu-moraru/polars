@@ -27,7 +27,7 @@ from polars.testing.parametric import column, dataframes, series
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
-    from polars._typing import PolarsDataType, TimeUnit
+    from polars._typing import EngineType, PolarsDataType, TimeUnit
     from tests.conftest import PlMonkeyPatch
 
 
@@ -1099,6 +1099,14 @@ def test_group_by_double_on_empty_12194() -> None:
     assert df.group_by("group").agg(squared_deviation_sum).schema == OrderedDict(
         [("group", pl.Int64), ("x", pl.Float64)]
     )
+
+
+@pytest.mark.parametrize("engine", ["in-memory", "streaming"])
+def test_group_by_repeat_literal_on_empty(engine: EngineType) -> None:
+    lf = pl.LazyFrame({"g": []}, schema={"g": pl.Int64})
+    q = lf.group_by("g").agg(pl.repeat(1, pl.len()).min())
+    expected = pl.DataFrame(schema={"g": pl.Int64, "literal": pl.Int32})
+    assert_frame_equal(q.collect(engine=engine), expected)
 
 
 def test_group_by_when_then_no_aggregation_predicate() -> None:
@@ -3352,5 +3360,39 @@ def test_group_by_filtered_agg_missing_group_29322() -> None:
             "v0": pl.Series([0, 5, 1, 0, 1], dtype=get_index_type()),
             "v1": [0, 35, 7, 6, 3],
         }
+    )
+    assert_frame_equal(result, expected)
+
+
+def test_group_by_arg_min_max_by_scalar_column_29504() -> None:
+    idx_dtype = pl.get_index_type()
+    df = pl.DataFrame({"k": [1], "v": [1.0], "p": [2]})
+
+    for empty in [df.clear(), df.filter(False)]:
+        result = empty.group_by("k").agg(
+            pl.col("v").max_by("p").alias("max_by"),
+            pl.col("v").min_by("p").alias("min_by"),
+            pl.col("p").arg_max().alias("arg_max"),
+            pl.col("p").arg_min().alias("arg_min"),
+        )
+        expected = pl.DataFrame(
+            schema={
+                "k": pl.Int64,
+                "max_by": pl.Float64,
+                "min_by": pl.Float64,
+                "arg_max": idx_dtype,
+                "arg_min": idx_dtype,
+            }
+        )
+        assert_frame_equal(result, expected)
+
+    df = pl.DataFrame({"k": [1, 2, 2], "v": [1.0, 2.0, 3.0]})
+    result = df.group_by("k", maintain_order=True).agg(
+        pl.col("v").max_by(pl.lit(1)).alias("max_by"),
+        pl.col("v").min_by(pl.lit(None, dtype=pl.Int64)).alias("min_by"),
+    )
+    expected = pl.DataFrame(
+        {"k": [1, 2], "max_by": [1.0, 2.0], "min_by": [None, None]},
+        schema_overrides={"min_by": pl.Float64},
     )
     assert_frame_equal(result, expected)

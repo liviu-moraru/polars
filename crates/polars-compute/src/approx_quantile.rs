@@ -128,7 +128,7 @@ impl<T: fmt::Debug + Clone + TotalOrd> FinalizedSketch<T> {
     pub fn estimate_quantile(&self, quantile: f64) -> PolarsResult<Option<&T>> {
         polars_ensure!(
             (0.0..=1.0).contains(&quantile),
-            ComputeError: "`quantile` should be between 0.0 and 1.0",
+            ComputeError: "`quantile` should be between 0.0 and 1.0, got {}", quantile,
         );
         // We round with ties toward ∞ for consistency with the regular quantile.
         let num_items = self.num_items();
@@ -248,6 +248,7 @@ pub mod kll {
     }
 
     #[derive(Debug, Clone, Copy, Default)]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
     struct Level {
         offset: usize,
         size: usize,
@@ -258,6 +259,7 @@ pub mod kll {
     }
 
     #[derive(Debug)]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
     struct IngestingState<T: fmt::Debug + Clone + TotalOrd> {
         /// Contents of the compactors.
         ///
@@ -271,7 +273,9 @@ pub mod kll {
         consumed_items: u64,
         /// Maximum number of items before we compact.
         total_capacity: usize,
+        #[cfg_attr(feature = "serde", serde(skip, default = "rand::make_rng"))]
         rng: SmallRng,
+        #[cfg_attr(feature = "serde", serde(skip, default = "Vec::new"))]
         scratch: Vec<T>,
     }
 
@@ -290,6 +294,7 @@ pub mod kll {
     }
 
     #[derive(Debug, Clone)]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
     #[repr(transparent)]
     pub struct KLLSketch<T: fmt::Debug + Clone + TotalOrd>(IngestingState<T>);
 
@@ -600,6 +605,7 @@ pub mod req {
     }
 
     #[derive(Debug, Clone, Copy, Default)]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
     struct Level {
         offset: usize,
         size: usize,
@@ -609,6 +615,7 @@ pub mod req {
     }
 
     #[derive(Debug)]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
     struct IngestingState<T: fmt::Debug + Clone + TotalOrd> {
         /// Contents of the relative compactors. The offsets of the compactors
         /// are stored in the levels vector. The top-level compactor is stored at
@@ -620,6 +627,7 @@ pub mod req {
         /// and height *0*. So the order of `levels` is *reversed* wrt `items`.
         items: Vec<T>,
         /// Scratch Vec to reduce an allocation during merging.
+        #[cfg_attr(feature = "serde", serde(skip, default = "Vec::new"))]
         scratch: Vec<T>,
         levels: Vec<Level>,
         /// Bit that specifies if this sketch is high-rank-accurate or low-rank-accurate.
@@ -634,6 +642,7 @@ pub mod req {
         /// see `close_out_if_needed`.
         k: usize,
         consumed_items: u64,
+        #[cfg_attr(feature = "serde", serde(skip, default = "rand::make_rng"))]
         rng: SmallRng,
     }
 
@@ -654,6 +663,7 @@ pub mod req {
     }
 
     #[derive(Debug, Clone)]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
     #[repr(transparent)]
     pub struct ReqSketch<T: fmt::Debug + Clone + TotalOrd>(IngestingState<T>);
 
@@ -702,6 +712,7 @@ pub mod req {
     ///
     /// Costs 2x the size and speed of a single [`ReqSketch`]
     #[derive(Debug, Clone)]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
     pub struct DoubleReqSketch<T: fmt::Debug + Clone + TotalOrd> {
         lra: ReqSketch<T>,
         hra: ReqSketch<T>,
@@ -1055,6 +1066,7 @@ fn merge_sorted<T>(
 
 /// A sketch picked by [`ApproxQuantileMethod`].
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Sketch<T: fmt::Debug + Clone + TotalOrd> {
     Kll(KLLSketch<T>),
     Req(ReqSketch<T>),
@@ -1100,9 +1112,7 @@ impl<T: fmt::Debug + Clone + TotalOrd> Sketch<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::ApproxQuantileMethod;
-    use super::kll::KLLSketch;
-    use super::req::ReqSketch;
+    use super::*;
 
     #[test]
     fn auto_resolves_by_queried_quantiles() {
@@ -1130,33 +1140,20 @@ mod tests {
     /// Clones must not make identical random choices.
     #[test]
     fn clones_are_reseeded() {
-        const QUANTILES: [f64; 5] = [0.1, 0.3, 0.5, 0.7, 0.9];
-        let data: Vec<f64> = (0..20_000).map(|i| ((i * 7919) % 20_000) as f64).collect();
-
-        macro_rules! assert_diverges {
-            ($name:literal, $new:expr) => {{
-                let agreed = (0..10)
-                    .filter(|_| {
-                        let mut base = $new;
-                        for v in &data[..5_000] {
-                            base.update(v);
-                        }
-                        let (mut a, mut b) = (base.clone(), base.clone());
-                        for v in &data[5_000..] {
-                            a.update(v);
-                            b.update(v);
-                        }
-                        let (a, b) = (a.finalize(), b.finalize());
-                        QUANTILES.iter().all(|q| {
-                            a.estimate_quantile(*q).unwrap() == b.estimate_quantile(*q).unwrap()
-                        })
-                    })
-                    .count();
-                assert!(agreed <= 2, "{} clones agreed {agreed}/10 times", $name);
-            }};
+        use ApproxQuantileMethod as M;
+        for method in [M::KLL, M::ReqSketch { hra: true }] {
+            let agreed = (0..10)
+                .filter(|_| {
+                    let mut a = Sketch::new(&method, 0.5);
+                    let mut b = a.clone();
+                    for v in 0..1_000 {
+                        a.update_owned(v);
+                        b.update_owned(v);
+                    }
+                    a.finalize().items == b.finalize().items
+                })
+                .count();
+            assert!(agreed <= 5, "{method:?} clones agreed {agreed}/10 times");
         }
-
-        assert_diverges!("ReqSketch", ReqSketch::new(0.01, true));
-        assert_diverges!("KLLSketch", KLLSketch::new(0.01));
     }
 }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crossbeam_queue::ArrayQueue;
-use polars_async::executor::{JoinHandle, TaskPriority, TaskScope};
+use polars_async::executor::{JoinHandle, TaskMetricAggregator, TaskPriority, TaskScope};
 use polars_async::primitives::wait_group::WaitGroup;
 use polars_core::frame::DataFrame;
 use polars_core::prelude::IntoColumn;
@@ -57,31 +57,28 @@ async fn select_key_columns(
     unsafe { DataFrame::new_unchecked_with_broadcast(df.height(), key_columns) }
 }
 
-/// Buffers the morsels of one side of a join until it ends, the sample limit
-/// is reached, or the other side ended and this side has many times its rows.
+/// Buffers the morsels of one side of a join until its stream ends or it has
+/// `limit` rows. When its stream ends, the other side is limited to
+/// `LOPSIDED_SAMPLE_FACTOR` times its rows: if this input is done, sampling ends
+/// there, and otherwise it continues in the next phase.
 async fn sample_sink(
     mut recv: PortReceiver,
     morsels: &mut Vec<Morsel>,
     len: &mut usize,
-    this_final_len: Arc<RelaxedCell<usize>>,
-    other_final_len: Arc<RelaxedCell<usize>>,
-    join_sample_limit: usize,
+    limit: Arc<RelaxedCell<usize>>,
+    other_limit: Arc<RelaxedCell<usize>>,
 ) -> PolarsResult<()> {
     while let Ok(mut morsel) = recv.recv().await {
         *len += morsel.height();
-        if *len >= join_sample_limit
-            || *len
-                >= other_final_len
-                    .load()
-                    .saturating_mul(LOPSIDED_SAMPLE_FACTOR)
-        {
+        if *len >= limit.load() {
             morsel.source_token().stop();
         }
 
         drop(morsel.take_consume_token());
         morsels.push(morsel);
     }
-    this_final_len.store(*len);
+    let lopsided_limit = len.saturating_mul(LOPSIDED_SAMPLE_FACTOR);
+    other_limit.store(other_limit.load().min(lopsided_limit));
     Ok(())
 }
 
@@ -168,10 +165,15 @@ struct BufferedStream {
 }
 
 impl BufferedStream {
-    pub fn new(name: PlSmallStr, morsels: Vec<Morsel>, start_offset: MorselSeq) -> Self {
+    pub fn new(
+        name: PlSmallStr,
+        morsels: Vec<Morsel>,
+        start_offset: MorselSeq,
+        task_metrics: Option<Arc<TaskMetricAggregator>>,
+    ) -> Self {
         // Relabel so we can insert into parallel streams later.
         let mut seq = start_offset;
-        let ctx = MostRecentSpillContext::new(name);
+        let ctx = MostRecentSpillContext::new(name, task_metrics);
         let queue = ArrayQueue::new(morsels.len().max(1));
         for morsel in morsels {
             let sf = SpillFrame::new_blocking(morsel.into_df_blocking(), &ctx);

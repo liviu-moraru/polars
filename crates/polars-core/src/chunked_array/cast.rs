@@ -225,7 +225,11 @@ where
             // TODO @ cat-rework: remove after exposing to/from physical functions.
             #[cfg(feature = "dtype-categorical")]
             DataType::Categorical(cats, _mapping) => {
-                polars_ensure!(self.dtype() == &cats.physical().dtype(), ComputeError: "cannot cast numeric types to 'Categorical'");
+                polars_ensure!(
+                    self.dtype() == &cats.physical().dtype(),
+                    ComputeError: "cannot cast `{}` to `Categorical`; only the physical type `{}` is supported",
+                    self.dtype(), cats.physical().dtype()
+                );
                 with_match_categorical_physical_type!(cats.physical(), |$C| {
                     // SAFETY: we are guarded by the type system.
                     type PhysCa = ChunkedArray<<$C as PolarsCategoricalType>::PolarsPhysical>;
@@ -536,7 +540,8 @@ impl ChunkCast for ArrayChunked {
             Array(child_type, width) => {
                 polars_ensure!(
                     *width == ca.width(),
-                    InvalidOperation: "cannot cast Array to a different width"
+                    InvalidOperation: "cannot cast Array to a different width (from {} to {})",
+                    ca.width(), width
                 );
 
                 match (ca.inner_dtype(), &**child_type) {

@@ -117,6 +117,23 @@ def test_join_cross_11927() -> None:
     assert res.collect().is_empty()
 
 
+@pytest.mark.parametrize("engine", ["in-memory", "streaming"])
+def test_cross_join_filter_decimal_scales_29762(engine: Any) -> None:
+    pv = pl.DataFrame(
+        {"ps_partkey": [1, 2, 3], "value": ["10.50", "2.25", "7.00"]},
+        schema_overrides={"value": pl.Decimal(38, 2)},
+    )
+    src = pl.DataFrame({"v": ["100.00"]}, schema_overrides={"v": pl.Decimal(38, 2)})
+    res = pl.SQLContext(pv=pv, src=src).execute(
+        """
+        WITH gv AS (SELECT SUM(v) * (0.0001 / 30) AS threshold FROM src)
+        SELECT pv.ps_partkey FROM pv CROSS JOIN gv
+        WHERE pv.value > gv.threshold ORDER BY pv.value DESC
+        """
+    )
+    assert res.collect(engine=engine)["ps_partkey"].to_list() == [1, 3, 2]
+
+
 def test_cross_join_unnest_from_table() -> None:
     df = pl.DataFrame({"id": [1, 2], "items": [[100, 200], [300, 400, 500]]})
     assert_sql_matches(
@@ -2227,3 +2244,20 @@ def test_join_on_filter_with_aggregate_key(how: Literal["inner", "left"]) -> Non
     expected = pl.DataFrame({"k": [3], "v": [1]})
     for result in [sql, api]:
         assert_frame_equal(result.collect(), expected, check_row_order=False)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT a.k, b.v FROM a JOIN b ON a.k = b.j AND b.j = a.k",
+        "SELECT a.k, b.v FROM a, b WHERE b.j = a.k AND a.k = b.j",
+    ],
+)
+def test_join_on_repeated_key(query: str) -> None:
+    frames = {
+        "a": pl.DataFrame({"k": [1, 2, 3]}),
+        "b": pl.DataFrame({"j": [2, 3, 4], "v": ["x", "y", "z"]}),
+    }
+    assert_sql_matches(
+        frames, query=query, compare_with="duckdb", check_row_order=False
+    )
